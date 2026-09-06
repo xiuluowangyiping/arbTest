@@ -62,8 +62,13 @@ class DatabaseManager:
         self.init_db()
         
     def _get_conn(self):
+        # [AI-2026-09-02] 不再每个连接执行 PRAGMA journal_mode=WAL：WAL 是数据库级持久属性，
+        # 设一次即永久生效；重复设在模式需变更时抢瞬时排他锁，遇并发写会把调用方（含 asyncio
+        # 主线程）死死卡住 —— loop-watchdog 抓到的 60s 全接口超时即由此而来。
+        # 改为进程内首次连接时确保一次（见 managers.base.ensure_wal_once）。
+        from .managers.base import ensure_wal_once
+        ensure_wal_once(self.db_path)
         conn = sqlite3.connect(self.db_path, timeout=15.0)
-        conn.execute('PRAGMA journal_mode=WAL;')
         return conn
     
     def init_db(self):
@@ -102,6 +107,31 @@ class DatabaseManager:
             conn.execute('CREATE INDEX IF NOT EXISTS idx_etf_prices_date ON usa_etf_daily_prices(date DESC)')
             conn.execute('CREATE INDEX IF NOT EXISTS idx_fund_basket ON fund_basket_weights(fund_code, date DESC)')
 
+            # [AI-2026-09-03] 基金季报披露持仓（160723 MVP）：支持按报告期存储前十大基金/股票投资明细
+            conn.execute('''
+                CREATE TABLE IF NOT EXISTS fund_report_holdings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fund_code TEXT NOT NULL,
+                    report_period TEXT NOT NULL,
+                    report_date TEXT NOT NULL,
+                    symbol TEXT,
+                    name TEXT NOT NULL,
+                    name_en TEXT,
+                    region TEXT,
+                    currency TEXT,
+                    type TEXT,
+                    operation_mode TEXT,
+                    manager TEXT,
+                    weight REAL NOT NULL,
+                    market_value REAL,
+                    is_stock INTEGER DEFAULT 0,
+                    sort_order INTEGER DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(fund_code, report_period, sort_order, is_stock)
+                )
+            ''')
+            conn.execute('CREATE INDEX IF NOT EXISTS idx_report_holdings ON fund_report_holdings(fund_code, report_period, sort_order)')
+
             conn.execute('''CREATE TABLE IF NOT EXISTS etf_raw_api_data (date TEXT NOT NULL, source TEXT NOT NULL, raw_content TEXT, updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')), PRIMARY KEY (date, source))''')
             conn.execute('''CREATE TABLE IF NOT EXISTS etf_rotation_list (group_id INTEGER, lof_code TEXT, lof_name TEXT, etf_code TEXT, etf_name TEXT, track_index TEXT, updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')), PRIMARY KEY (lof_code, etf_code))''')
             conn.execute('''CREATE TABLE IF NOT EXISTS fund_purchase_status (fund_code TEXT PRIMARY KEY, purchase_status TEXT, redemption_status TEXT, purchase_fee TEXT, redemption_fee TEXT, purchase_limit REAL, updated_at TIMESTAMP DEFAULT (datetime('now', 'localtime')))''')
@@ -132,7 +162,7 @@ class DatabaseManager:
                 initial_sources = [
                     ('realtime_market', 'tdx', 1, 1, '{"desc": "通达信内存直连"}'),
                     ('realtime_market', 'guojin', 2, 1, '{"desc": "国金QMT (xtquant)"}'),
-                    ('realtime_market', 'galaxy', 3, 1, '{"desc": "银河QMT (Socket)"}'),
+                    ('realtime_market', 'tencent', 3, 1, '{"desc": "腾讯财经"}'),
                     ('realtime_market', 'sina', 4, 1, '{"desc": "新浪财经轮询"}')
                 ]
                 conn.executemany('''
