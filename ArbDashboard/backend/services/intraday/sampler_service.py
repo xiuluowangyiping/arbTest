@@ -13,6 +13,41 @@ def _scalar_level(v):
         return float(v[0]) if v[0] is not None else 0
     return v
 
+# [配套改进 2026-09-26] 中国法定节假日（A股休市日）排除，根治"把休市日误判为采样断档"。
+# 来源：国务院办公厅《关于2026年部分节假日安排的通知》(2025-11-04)。
+# 每年需更新此表；补班日(调休上班的周末)单独列出，优先于周末判定。
+_CN_HOLIDAYS_2026 = {
+    # 元旦 1/1-1/3
+    '2026-01-01','2026-01-02','2026-01-03',
+    # 春节 2/15-2/23（腊月廿八至正月初七）
+    '2026-02-15','2026-02-16','2026-02-17','2026-02-18','2026-02-19','2026-02-20','2026-02-21','2026-02-22','2026-02-23',
+    # 清明 4/4-4/6
+    '2026-04-04','2026-04-05','2026-04-06',
+    # 劳动节 5/1-5/5
+    '2026-05-01','2026-05-02','2026-05-03','2026-05-04','2026-05-05',
+    # 端午 6/19-6/21
+    '2026-06-19','2026-06-20','2026-06-21',
+    # 中秋 9/25-9/27（不调休）
+    '2026-09-25','2026-09-26','2026-09-27',
+    # 国庆 10/1-10/7
+    '2026-10-01','2026-10-02','2026-10-03','2026-10-04','2026-10-05','2026-10-06','2026-10-07',
+}
+# 调休补班日：本为周末，但法定上班（算交易日）。来源同上。
+_CN_MAKEUP_WORKDAYS_2026 = {
+    '2026-01-04','2026-02-14','2026-02-28','2026-05-09','2026-09-20','2026-10-10',
+}
+
+def is_trading_day(d):
+    """A股交易日判定：周一~周五，排除法定假日；补班日(调休上班的周末)算交易日。"""
+    if not isinstance(d, datetime):
+        d = datetime(d.year, d.month, d.day) if hasattr(d, 'date') else d
+    ds = d.strftime('%Y-%m-%d')
+    if ds in _CN_MAKEUP_WORKDAYS_2026:
+        return True
+    if ds in _CN_HOLIDAYS_2026:
+        return False
+    return d.weekday() < 5
+
 class IntradaySamplerService:
     """
     分时数据采样服务 (每分钟执行一次)
@@ -28,6 +63,29 @@ class IntradaySamplerService:
         self.active_watchlist = []
         self.lof_prices = {}   # [2026-08-21] LOF买卖一价缓存
         self.etf_prices = {}   # [2026-08-21] ETF买卖一价缓存
+
+    def _load_db_basket(self, fund_code: str):
+        """[AI-2026-09-22 第2步断源] 读 fund_basket_weights 最新日期篮子（yaml 同构 list[dict]）。
+
+        采样取价清单与计算口径统一以 DB 为唯一权威，不再读 yaml 的 valuation_portfolio /
+        hedging_portfolio 旧口径（旧口径与 DB 权威不一致 → 会订到 DB 里根本不存在的标的，
+        把富途订阅额度撑爆）。无行返回空 list —— 不兜底 yaml：缺失即缺失，表现为
+        「该基金本轮无标的可取价」，而不是静默回落到另一套口径。
+        """
+        try:
+            conn = self.db._get_conn()
+            rows = conn.execute(
+                "SELECT underlying_symbol, weight FROM fund_basket_weights "
+                "WHERE fund_code = ? "
+                "AND date = (SELECT MAX(date) FROM fund_basket_weights WHERE fund_code = ?) "
+                "ORDER BY weight DESC",
+                (fund_code, fund_code)
+            ).fetchall()
+            conn.close()
+            return [{'symbol': r[0], 'weight': r[1]} for r in rows if r[0]]
+        except Exception as e:
+            logger.warning(f"采样读取DB篮子失败 {fund_code}: {e}")
+            return []
 
     async def start(self):
         if self.running: return
@@ -56,11 +114,12 @@ class IntradaySamplerService:
         logger.info("⏹️ 分时采样服务已停止")
 
     def is_market_open(self):
-        """判断是否为 A 股交易时间 (9:30-11:30, 13:00-15:00)"""
+        """判断是否为 A 股交易时间 (9:30-11:30, 13:00-15:00)，并排除法定节假日"""
         now = datetime.now()
-        # 排除周末
-        if now.weekday() >= 5: return False
-        
+        # 排除周末与法定节假日（补班日已在内判定为交易日）
+        if not is_trading_day(now):
+            return False
+
         current_time = now.strftime('%H:%M')
         if '09:30' <= current_time <= '11:30' or '13:00' <= current_time <= '15:00':
             return True
@@ -68,19 +127,25 @@ class IntradaySamplerService:
 
     async def _sampling_loop(self):
         while self.running:
+            # [AI-2026-09-22] 轮次对齐自然分钟：slot 为本轮起算时刻，落库时间戳由它决定。
+            slot = datetime.now()
             try:
                 if self.is_market_open():
                     # [修复] 同步网络/DB 调用不应跑在事件循环上，整体丢线程池避免 head-of-line 阻塞
-                    await asyncio.to_thread(self._perform_sample_sync)
+                    await asyncio.to_thread(self._perform_sample_sync, slot)
             except Exception as e:
                 import traceback
                 logger.error(f"🚨 采样循环异常: {e}")
                 logger.error(traceback.format_exc())
-            
-            # 每 60 秒采样一次
-            await asyncio.sleep(60)
 
-    def _perform_sample_sync(self):
+            # [AI-2026-09-22] 原实现是「跑完再 sleep 60s」⇒ 周期 = 60s + 本轮耗时，
+            # 上游一慢（富途额度满/重连、DB 写锁竞争）周期就变成 2~8 分钟且**永久累积漂移**，
+            # 分时序列出现大面积分钟空档。现改为「睡到本轮起算时刻的下一个整分」：
+            # 慢轮次只吃掉自己那几格，恢复正常后立刻回到逐分钟，不再一路漂下去。
+            elapsed = (datetime.now() - slot).total_seconds()
+            await asyncio.sleep(max(1.0, 60.0 - (elapsed % 60.0)))
+
+    def _perform_sample_sync(self, slot=None):
         try:
             # 加载所有的配置基金
             all_config_funds = []
@@ -111,14 +176,23 @@ class IntradaySamplerService:
             current_fx = None
             try:
                 conn = self.db._get_conn()
-                row = conn.execute("SELECT usd_cny_mid FROM exchange_rate ORDER BY date DESC LIMIT 1").fetchone()
+                # [配套改进 2026-09-26] 跳过法定假日 NULL 行（如中秋 9/25 央行不发布中间价），
+                # 回退到最近有效汇率，避免假日采样因 FX 缺失而 0 行 / 误触发守卫。
+                row = conn.execute(
+                    "SELECT usd_cny_mid FROM exchange_rate "
+                    "WHERE usd_cny_mid IS NOT NULL ORDER BY date DESC LIMIT 1"
+                ).fetchone()
                 conn.close()
                 if row and row[0]:
                     current_fx = float(row[0])
                     logger.info(f"📊 采样服务使用美元中间价汇率: {current_fx}")
             except Exception as e:
                 logger.warning(f"⚠️ 获取美元中间价汇率失败: {e}")
-            
+
+            # [A-守卫] FX 缺失守卫：usd_cny_mid 为 NULL/表空 → 估值必失败、本轮大概率 0 行
+            if current_fx is None:
+                logger.warning("⚠️ [采样守卫] exchange_rate.usd_cny_mid 缺失或为空，实时估值将失败，本轮可能 0 行写入")
+
             # [修复] 构建完整符号的实时价格字典（如 ^INDA-EU → 35.5）
             current_etfs = {}
             
@@ -127,11 +201,11 @@ class IntradaySamplerService:
             for f in funds_to_sample:
                 if f is None:
                     continue
-                # 获取估值组合中ETF的实时价格（完整符号如 ^INDA-EU）
-                v_port = f.get('valuation_portfolio') or []
-                h_port = f.get('hedging_portfolio') or []
-                portfolio = v_port if v_port else h_port
-                if portfolio is None: portfolio = []
+                # [AI-2026-09-22 第2步断源] 取价清单改读 fund_basket_weights 最新日期（DB 唯一权威），
+                # 不再读 yaml 的 valuation_portfolio / hedging_portfolio 旧口径。采样取价与计算口径
+                # 由此统一（计算侧 DynamicValuationCalculator 本就用 DB _basket 覆盖 yaml portfolio）。
+                _fcode = str(f.get('code', '')).strip()
+                portfolio = self._load_db_basket(_fcode)
                 
                 for item in portfolio:
                     if item is None:
@@ -183,7 +257,12 @@ class IntradaySamplerService:
                         'price': q['price']
                     }
                     logger.info(f"📈 采样ETF: {symbol} price={q['price']}, bid={q.get('bid')}, ask={q.get('ask')}")
-            
+
+            # [A-守卫] ETF 取价守卫：待采美股ETF全部取价失败 → 行情源/OpenD链路断
+            _etf_ok = sum(1 for s in us_etf_symbols if s in current_etfs)
+            if us_etf_symbols and _etf_ok == 0:
+                logger.warning(f"⚠️ [采样守卫] {len(us_etf_symbols)} 只美股ETF全部取价失败(行情源/OpenD链路断?)，本轮估值必缺")
+
             # 第三步：采集自选LOF基金的实时价格
             for f in funds_to_sample:
                 if f is None:  # [修复] 跳过None元素
@@ -208,12 +287,16 @@ class IntradaySamplerService:
                         }
             
             # 执行采样
-            now = datetime.now()
+            # [AI-2026-09-22] 时间戳改用「本轮起算时刻」(slot) 而非落库时刻 datetime.now()。
+            # 取价段若被上游阻塞数分钟，用落库时刻会把 14:44 采到的数据标成 15:11
+            # （既越过收盘、又在序列里拉出假空档）。分钟位必须由轮次起点决定。
+            now = slot or datetime.now()
             date_str = now.strftime('%Y-%m-%d')
             time_str = now.strftime('%H:%M')
             conn = self.db._get_conn()
             try:
                 cursor = conn.cursor()
+                written = 0
                 for fund in funds_to_sample:
                     if fund is None:  # [修复] 跳过None元素
                         continue
@@ -239,7 +322,8 @@ class IntradaySamplerService:
                         #   开仓时卖空ETF吃买一（低价），成本保守→估值偏低→溢价偏高
                         # backendRtValPeg: 用ETF卖一价（ask）计算
                         #   平仓时买平ETF吃卖一（高价），成本激进→估值偏高→溢价偏低
-                        portfolio = fund.get('valuation_portfolio', []) or fund.get('hedging_portfolio', [])
+                        # [AI-2026-09-22 第2步断源] 主标的改取 DB 篮子权重最大者（与计算口径一致）
+                        portfolio = self._load_db_basket(code)
                         etf_symbol = portfolio[0].get('symbol', '') if portfolio else ''
                         etf_bid = _scalar_level(self.etf_prices.get(etf_symbol, {}).get('bid', 0)) if etf_symbol else 0
                         etf_ask = _scalar_level(self.etf_prices.get(etf_symbol, {}).get('ask', 0)) if etf_symbol else 0
@@ -276,7 +360,11 @@ class IntradaySamplerService:
                         """, (code, date_str, time_str, price, rt_val, premium,
                               open_premium, close_premium,
                               lof_bid, lof_ask, etf_bid, etf_ask))
+                        written += 1
                 conn.commit()
+                # [A-守卫] 整轮写库守卫：有基金要采却 0 行 → 取价/估值全断，盲窗！
+                if len(funds_to_sample) > 0 and written == 0:
+                    logger.warning(f"⚠️ [采样守卫] 本轮意图采样 {len(funds_to_sample)} 只基金但 0 行写入，疑似行情源/FX/估值链路静默失败")
             except Exception as e:
                 logger.error(f"❌ 采样写入数据库失败: {e}")
                 import traceback

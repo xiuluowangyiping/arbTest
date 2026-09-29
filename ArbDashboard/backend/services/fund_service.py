@@ -1363,31 +1363,14 @@ class FundService:
                 params.extend(cats)
 
             funds_df = pd.read_sql_query(
-                # [AI-2026-08-05] 增加 paused_exempt 字段，用于豁免分类暂停
-                f"SELECT fund_code, fund_name, category, related_index, pos_ratio, idx_code, idx_name, paused_exempt FROM unified_fund_list {where_clause}",
+                # [AI-2026-09-23] paused_exempt 列随分类级暂停功能删除已废弃（仅保留表结构兼容），不再读取
+                f"SELECT fund_code, fund_name, category, related_index, pos_ratio, idx_code, idx_name FROM unified_fund_list {where_clause}",
                 conn, params=params
             )
 
             if funds_df is None or funds_df.empty:
                 _dashboard_cache.set(cache_key, [])
                 return []
-
-            # [AI-2026-07-20] 从结果中剔除暂停分类的基金（不生成快照、不占 CPU）
-            # 注意：paused_set 可能在本方法前面已定义（指数过滤处），也可能未定义
-            if 'paused_set' not in dir():
-                try:
-                    import json
-                    raw = self.db.get_app_setting('paused_categories', None)
-                    paused_set = set(json.loads(raw)) if raw else set()
-                except Exception:
-                    paused_set = set()
-            if paused_set:
-                before = len(funds_df)
-                # [AI-2026-08-05] 豁免基金(paused_exempt=1)不受分类暂停影响，仍展示+计算估值
-                mask_paused = funds_df['category'].isin(paused_set) & (funds_df['paused_exempt'] == 0)
-                funds_df = funds_df[~mask_paused]
-                if len(funds_df) < before:
-                    logger.debug(f"[DASHBOARD-FILTER] 过滤暂停分类(保留豁免)，{before} -> {len(funds_df)} 只基金")
 
             # ── 2. 批量获取 fund_purchase_status 状态费率（AKShare 日更）──
             status_df = pd.read_sql_query(
@@ -1423,18 +1406,8 @@ class FundService:
             hist_grouped = hist_df.groupby('fund_code') if not hist_df.empty else {}
 
             # 【V7.0 工业级升级】 批量预取所有跟踪指数的日内涨跌幅
-            # [AI-2026-07-20] 根据 paused_categories 过滤：暂停的分类不抓指数
-            try:
-                import json
-                raw = self.db.get_app_setting('paused_categories', None)
-                paused_set = set(json.loads(raw)) if raw else set()
-            except Exception:
-                paused_set = {'QDII亚洲', '国内LOF', '现金管理'}
-            # [AI-2026-08-05] funds_df 已在上方按 paused_exempt 过滤（豁免基金保留），无需重复过滤
+            # [AI-2026-09-23] 分类级暂停功能已删除，所有分类统一预取指数（空分类无基金，indices_to_fetch 自然为空）
             indices_to_fetch = funds_df['related_index'].dropna().tolist()
-            if paused_set:
-                logger.debug(f"[INDEX-FILTER] 暂停分类(含豁免) {sorted(paused_set)}，抓取 {len(indices_to_fetch)} 个指数")
-            
             index_changes_map = prefetch_index_changes(indices_to_fetch, conn=conn)
             _prof['prefetch_index'] = _t.perf_counter()  # [埋点A] 指数预取段结束
 
@@ -1442,7 +1415,18 @@ class FundService:
             funds_with_basket = set()
             basket_symbols_by_fund = {}  # [AI-2026-08-17] code -> set(underlying_symbol)，供「缺FUTU」源依赖判断
             try:
-                basket_codes_df = pd.read_sql("SELECT fund_code, underlying_symbol FROM fund_basket_weights", conn)
+                # [AI-2026-09-22 第2步断源·补齐] 原 SQL 无日期过滤 ⇒ 取到的是**全历史**成分：
+                #   已调出标的（160644 的 ASML/GOOGL/AVGO、501312 的 FINX、160216 的 CPER、
+                #   港股 00700/03690/09988 等）与「最新篮子」差集达 63 vs 54 个，
+                #   它们会被塞进下面的并发预取清单 → 走 get_realtime_quote → 触发富途订阅/取价，
+                #   白白吃正股额度（1 标的=2 额度）并拖慢整个主面板重算。
+                # 改为「每只基金自身最新日期」，口径与 sampler_service._load_db_basket /
+                # market_data_service._get_futu_symbols 完全一致（单一权威）。
+                basket_codes_df = pd.read_sql(
+                    "SELECT b.fund_code, b.underlying_symbol FROM fund_basket_weights b "
+                    "WHERE b.date = (SELECT MAX(date) FROM fund_basket_weights "
+                    "WHERE fund_code = b.fund_code)",
+                    conn)
                 funds_with_basket = set(basket_codes_df['fund_code'].tolist())
                 for _, r in basket_codes_df.iterrows():
                     basket_symbols_by_fund.setdefault(r['fund_code'], set()).add(r['underlying_symbol'])
@@ -1482,20 +1466,6 @@ class FundService:
                 code = fund['fund_code']
                 _vf_start = time.perf_counter()  # [埋点A] 逐基金计时起点
                 category = fund.get('category', '')
-
-                # [AI-2026-07-20] 暂停分类 ❌ 直接跳过，不计算实时估值、不产生 WARNING 日志
-                # [AI-2026-08-05] 豁免基金(paused_exempt=1)不跳过，正常计算估值
-                if category in paused_set and fund.get('paused_exempt', 0) == 0:
-                    result.append({
-                        'fund_code': code,
-                        'fund_name': fund.get('fund_name', ''),
-                        'category': category,
-                        'price': 0, 'nav': 0,
-                        'static_val': 0, 'static_premium': 0,
-                        'rt_val': None, 'rt_premium': None,
-                        'sub_category': _FUNDS_SUB_CATEGORY.get(code, ''),
-                    })
-                    continue
 
                 # ── 3a. 从批量历史数据中提取该基金的 metrics ──
                 if not hist_df.empty and code in hist_grouped.groups:
@@ -1813,14 +1783,30 @@ class FundService:
                     rel_idx = fund.get('related_index', '')
                     idx_category, _ = _classify_index_symbol(rel_idx)
                     is_us_etf = (idx_category == 'skip')  # 美股ETF在_classify_index_symbol中返回'skip'
-                    if not metrics.get('rt_val') and code not in funds_with_basket and not is_us_etf and not _YAML_TRADE_ETF.get(code, ''):
+                    # [AI-2026-09-11] 指数价(index_close)独立赋值：不再受 rt_val 是否已算的限制。
+                    # 此前 QDII日本等指数ETF 的 rt_val 先被篮子/SI/trade_etf 路径算出，导致下方 3.2 块被
+                    # `not metrics.get('rt_val')` 跳过，index_close 永不赋值 → 主面板「指数价」恒为空白。
+                    if rel_idx and rel_idx != '-':
+                        idx_data = index_changes_map.get(rel_idx)
+                        if idx_data is not None and isinstance(idx_data, dict):
+                            metrics['index_close'] = idx_data.get('price', 0.0)
+                            metrics['index_pct'] = idx_data.get('pct', 0.0)
+                        else:
+                            # [FIX] 无实时数据时设置为0，前端统一显示 '-'
+                            # 注：index_changes_map 中找不到该指数，可能原因：
+                            # 1. index_history 表没有该指数数据
+                            # 2. related_index 字段值为文本描述而非代码
+                            # 3. 数据源异常
+                            metrics['index_pct'] = 0.0
+                            metrics['index_close'] = 0.0
+                    # 3.2 【普通国内LOF/QDII亚洲极速估值】 - 仅对无权重篮子且无trade_etf的基金使用简化指数估值
+                    # [AI-2026-09-11] rt_val 计算与 index_close 解耦：此处仅在 rt_val 尚未算出且指数源可用时补算。
+                    if not metrics.get('rt_val') and code not in funds_with_basket and not is_us_etf and not _YAML_TRADE_ETF.get(code, '') and rel_idx and rel_idx != '-':
                         nav_home = float(metrics.get('nav', 0))
-                        if rel_idx and rel_idx != '-' and nav_home > 0:
+                        if nav_home > 0:
                             idx_data = index_changes_map.get(rel_idx)
                             if idx_data is not None and isinstance(idx_data, dict):
                                 pct = idx_data.get('pct', 0.0)
-                                metrics['index_close'] = idx_data.get('price', 0.0)
-                                metrics['index_pct'] = pct
                                 # [V10.15] pct!=0：用实时涨跌幅计算 rt_val
                                 # pct==0：指数未变化（收盘后/非交易日/平盘）→ rt_val=最新净值
                                 pos = float(fund.get('pos_ratio') or 0.95)
@@ -1828,14 +1814,6 @@ class FundService:
                                 metrics['rt_val'] = round(rt_val, 4)
                                 if metrics.get('price', 0) > 0:
                                     metrics['rt_premium'] = round((metrics['price'] / rt_val - 1) * 100, 3)
-                            else:
-                                # [FIX] 无实时数据时设置为0，前端统一显示 '-'
-                                # 注：index_changes_map 中找不到该指数，可能原因：
-                                # 1. index_history 表没有该指数数据
-                                # 2. related_index 字段值为文本描述而非代码
-                                # 3. 数据源异常
-                                metrics['index_pct'] = 0.0
-                                metrics['index_close'] = 0.0
 
                     # 3.3 【美股原油/黄金等高价值一篮子基金】 - 保持原有基于 lof_config.yaml 的矩阵公式推演
                     calculator = self._get_calculator() if not metrics.get('rt_val') else None
@@ -1915,7 +1893,23 @@ class FundService:
                                             logger.debug(f"[{code}] 跳过 {raw_sym}（{ex} 今日休市）")
                                             continue
                                         # [B1-2026-08-26] 优先复用预取的篮子成分价（已含新浪期货路径），绝不再触发新浪请求
-                                        q = quotes_dict.get(sym_base) or self.market_data_service.get_realtime_quote(sym_base)
+                                        # [FIX-2026-09-23] 篮子成分可能含 woody 合成对冲符号(如 znb_DAX/znb_NKY)或未在
+                                        # lof_config.yaml 声明的 symbol，get_realtime_quote 会因路由 KeyError 抛异常。
+                                        # 此处容错：单个成分取价失败 → 记 WARNING 并跳过该成分(已加入 required_bases 但不进
+                                        # current_etfs → 触发下方 _basket_missing_etf → 实时值干净为 None)，绝不让单只成分
+                                        # 拖垮整只基金实时估值、更绝不回落到陈旧采样值兜底(见 2062 行 stale 分支)。
+                                        try:
+                                            q = quotes_dict.get(sym_base) or self.market_data_service.get_realtime_quote(sym_base)
+                                        except Exception as e:
+                                            # [FIX-2026-09-23] 路由 KeyError（symbol 未在 symbol_sources 声明，
+                                            # 如 woody 合成对冲符号 znb_DAX/znb_NKY）= 设计内预期：该成分本就不参与
+                                            # 实时估值（东哥拍板实时值静默显 '-'），降级为 debug 不刷 WARNING。
+                                            # 其他真实异常（网络/行情源故障）仍记 WARNING，避免掩盖真实故障。
+                                            if isinstance(e, KeyError) or ('未在' in str(e) and 'symbol_sources' in str(e)):
+                                                logger.debug(f"[{code}] 篮子成分 {sym_base} 未声明数据源(合成/对冲符号)，跳过该成分: {e}")
+                                            else:
+                                                logger.warning(f"[{code}] 篮子成分 {sym_base} 实时价获取失败，跳过该成分: {e}")
+                                            continue
                                         # [AI-2026-07-20] 实时估值必须用买一价 bid，禁止用成交价 price（见 AGENTS.md 7.3.4）
                                         # [AI-2026-08-17] A股源 bid 为5档list，IB/FUTU 为标量 → 统一取买一价标量（bid[0]）
                                         if q:
@@ -2248,7 +2242,9 @@ DailyUpdater()._step4_fetch_prices()
     def get_fund_history(self, fund_code: str) -> List[Dict[str, Any]]:
         """
         历史对账数据（验算用）。
-        - 不使用 bfill 填充净值（防止今天/昨天出现虚假的旧净值）
+        - 净值只取官方净值 h.nav，缺失即返回 NULL（让前端显示 '-'），
+          绝不用 fund_daily_factors.nav 兜底（那是虚假的旧净值，违背"不 bfill"原则，
+          曾导致 9-11 等 T+1 未公布日错误显示成前一交易日净值）。
         - 不过滤当天行（exchange_rate LEFT JOIN 可能带回当天汇率，用于显示）
         - 不将 None 填充为 0（让前端正确显示 '-'）
         """
@@ -2256,10 +2252,11 @@ DailyUpdater()._step4_fetch_prices()
         try:
             today = datetime.now().strftime('%Y-%m-%d')
 
-            # 1. 基础历史数据 (包含静态估值、汇率、并从 fund_daily_factors 回填缺失的净值 + hedge)
+            # 1. 基础历史数据 (包含静态估值、汇率、hedge/position 来自 fund_daily_factors；
+            #    净值 h.nav 缺失即 NULL，不向 f.nav 兜底)
             query_hist = """
             SELECT h.date, h.price,
-                   COALESCE(h.nav, f.nav) as nav,
+                   h.nav as nav,
                    h.static_val, h.premium as static_premium, h.calibration,
                    h.index_close, h.index_pct, h.shares, h.shares_added, h.trade_volume, h.turnover_rate, h.volume,
                    h.valuation_error,

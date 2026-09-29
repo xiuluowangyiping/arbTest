@@ -56,6 +56,51 @@ export function getFundHoldingValuation(code: string, period: string) {
   return client.get(`/api/fund/${code}/holding-valuation`, { params: { period } })
 }
 
+/** 季报持仓分析：持仓静态估值核心列（读本地缓存 holding_static_val，B方案） */
+export function getFundHoldingRecalc(code: string, period: string = '2026H1', start: str = '2026-07-01') {
+  return client.get(`/api/fund/${code}/holding-recalc`, { params: { period, start } })
+}
+
+/** 季报持仓分析：持仓静态估值全量诊断（etf_prices/fill_warning/note，按需从 ARM 取） */
+export function getFundHoldingRecalcDetail(code: string, period: string = '2026H1', start: str = '2026-07-01') {
+  return client.get(`/api/fund/${code}/holding-recalc-detail`, { params: { period, start } })
+}
+
+/** B方案：手动触发 本地←ARM 拉取原油三基金 holding_static_val */
+export function syncOilStatic(code: string) {
+  return client.post(`/api/fund/${code}/sync-oil-static`)
+}
+
+/** 季报持仓分析：持仓实时估值（Model B，季报持仓法 + CL 期货实时价） */
+export function getFundHoldingRealtime(code: string) {
+  return client.get(`/api/fund/${code}/holding-realtime`)
+}
+
+/** 对冲穿透：底层 ETF 实际持有合约月 + 归一化 CL 对冲分布（对冲页表1/表2） */
+export function getFundHedgeExposure(code: string) {
+  return client.get(`/api/fund/${code}/hedge-exposure`)
+}
+
+/** 从 ARM 拉 CL 三时点冻结价到本地（盘前手动触发一次即可） */
+export function syncFuturesFreeze() {
+  return client.post(`/api/fund/sync-freeze`)
+}
+
+/** 从 ARM 拉美股/伦敦/港股 ETF 日 K（usa_etf_daily_prices）全表到本地（手动触发） */
+export function syncUsaEtf() {
+  return client.post(`/api/fund/sync-usa-etf`)
+}
+
+// [AI-2026-09-24 东哥需求] ARM 美股价新鲜度检测（只读）：ARM 是否已抓到新浪口径的最新美股收盘日
+export function getOilPriceFreshness() {
+  return client.get(`/api/fund/oil-price-freshness`)
+}
+
+// [AI-2026-09-24 东哥需求] 一键闭环：本地重抓新浪 → 推 ARM → ARM 重算 → 拉回本地
+export function refetchOilPrices() {
+  return client.post(`/api/fund/oil-refetch-prices`)
+}
+
 /** 市场概览（汇率、活跃数据源、统计） */
 export function getMarketOverview() {
   return client.get('/api/market/overview')
